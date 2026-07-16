@@ -1,0 +1,117 @@
+"""FastAPI entry point for the Arufa service.
+
+Exposes the four endpoints scored by FDEBench:
+
+- ``GET  /health``      liveness probe
+- ``POST /triage``      task 1
+- ``POST /extract``     task 2
+- ``POST /orchestrate`` task 3
+
+Each scored route wraps its pipeline in ``try/except`` so an engine
+failure surfaces as ``HTTP 200`` + task envelope with ``errors[]``,
+never a 5xx. Malformed HTTP/JSON goes to the ``RequestValidationError``
+handler (probes 1–3, 5).
+
+Run locally::
+
+    cd py/apps/arufa
+    uv run uvicorn arufa.main:app --port 8000 --reload
+"""
+
+from __future__ import annotations
+
+from fastapi import FastAPI
+
+from arufa import extract as extract_pkg
+from arufa import orchestrate as orchestrate_pkg
+from arufa import triage as triage_pkg
+from arufa.extract.pipeline import run as _run_extract
+from arufa.orchestrate.pipeline import run as _run_orchestrate
+from arufa.shared import exception_handlers
+from arufa.shared.config import get_settings
+from arufa.shared.middleware import RequestContextMiddleware
+from arufa.shared.models import ErrorEntry
+from arufa.shared.models.extract import ExtractRequest
+from arufa.shared.models.extract import ExtractResponse
+from arufa.shared.models.orchestrate import OrchestrateRequest
+from arufa.shared.models.orchestrate import OrchestrateResponse
+from arufa.shared.models.triage import TriageRequest
+from arufa.shared.models.triage import TriageResponse
+from arufa.shared.observability import configure_logging
+from arufa.shared.observability import get_logger
+from arufa.triage.pipeline import run as _run_triage
+
+# Suppress "unused import" for the package handles — we need them
+# imported so their side-effect ``__init__`` files run.
+_ = (triage_pkg, extract_pkg, orchestrate_pkg)
+
+settings = get_settings()
+configure_logging(settings.log_level)
+logger = get_logger(__name__)
+
+app = FastAPI(
+    title="Arufa",
+    description="Signal triaging, extraction, and orchestration for FDEBench",
+    version="0.1.0",
+)
+app.add_middleware(RequestContextMiddleware)
+exception_handlers.register(app)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness probe. Returns ``{"status": "ok"}`` when the service is up."""
+    return {"status": "ok"}
+
+
+@app.post("/triage")
+async def triage(request: TriageRequest) -> TriageResponse:
+    """Task 1: signal triage.
+
+    Engine failures return ``HTTP 200`` with a safe-default envelope and
+    an ``errors[]`` entry — never 5xx (per FDEBench contract).
+    """
+    try:
+        return await _run_triage(request)
+    except Exception as exc:
+        logger.exception("triage_pipeline_failed", ticket_id=request.ticket_id)
+        return TriageResponse(
+            ticket_id=request.ticket_id,
+            category="Not a Mission Signal",
+            priority="P4",
+            assigned_team="None",
+            needs_escalation=False,
+            missing_information=[],
+            next_best_action="",
+            remediation_steps=[],
+            errors=[ErrorEntry(code="triage_pipeline_error", detail=str(exc)[:500])],
+        )
+
+
+@app.post("/extract")
+async def extract(request: ExtractRequest) -> ExtractResponse:
+    """Task 2: document extraction."""
+    try:
+        return await _run_extract(request)
+    except Exception as exc:
+        logger.exception("extract_pipeline_failed", document_id=request.document_id)
+        return ExtractResponse(
+            document_id=request.document_id,
+            errors=[ErrorEntry(code="extract_pipeline_error", detail=str(exc)[:500])],
+        )
+
+
+@app.post("/orchestrate")
+async def orchestrate(request: OrchestrateRequest) -> OrchestrateResponse:
+    """Task 3: workflow orchestration."""
+    try:
+        return await _run_orchestrate(request)
+    except Exception as exc:
+        logger.exception("orchestrate_pipeline_failed", task_id=request.task_id)
+        return OrchestrateResponse(
+            task_id=request.task_id,
+            status="failed",
+            steps_executed=[],
+            constraints_satisfied=[],
+            errors=[ErrorEntry(code="orchestrate_pipeline_error", detail=str(exc)[:500])],
+        )

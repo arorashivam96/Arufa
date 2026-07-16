@@ -79,35 +79,38 @@ Arufa/
 │   ├── apps/
 │   │   ├── arufa/         # ← OUR SERVICE
 │   │   │   ├── pyproject.toml
-│   │   │   ├── src/arufa/
-│   │   │   │   ├── main.py                # FastAPI app, route wiring only
+│   │   │   ├── arufa/                     # package (flat layout, matches apps/sample)
+│   │   │   │   ├── main.py                # FastAPI app + route try/except → 200 + envelope
 │   │   │   │   ├── shared/                # Kernel: llm client, obs, config, exception handlers, models
-│   │   │   │   │   ├── llm/client.py
-│   │   │   │   │   ├── config.py
-│   │   │   │   │   ├── observability.py
-│   │   │   │   │   ├── middleware.py
-│   │   │   │   │   ├── exception_handlers.py
-│   │   │   │   │   └── models/            # Pydantic envelopes + enums
+│   │   │   │   │   ├── config.py          # pydantic-settings Settings + get_settings()
+│   │   │   │   │   ├── observability.py   # structlog + ContextVars (llm_call_var, request_id_var)
+│   │   │   │   │   ├── middleware.py      # Pure ASGI: X-Request-Id / X-Latency-Ms / X-Model-Name headers
+│   │   │   │   │   ├── exception_handlers.py  # 422 for malformed HTTP/JSON (probes 1–3, 5)
+│   │   │   │   │   ├── llm/
+│   │   │   │   │   │   ├── client.py      # LLMClient (Retry-After, semaphore, reasoning_effort)
+│   │   │   │   │   │   ├── errors.py      # LLMUnavailable
+│   │   │   │   │   │   └── result.py      # LLMResult dataclass
+│   │   │   │   │   └── models/            # ErrorEntry + per-task Pydantic envelopes
 │   │   │   │   ├── triage/                # Task 1
 │   │   │   │   │   ├── pipeline.py
-│   │   │   │   │   └── safety_rules.py
+│   │   │   │   │   └── safety_rules.py    # (M4)
 │   │   │   │   ├── extract/               # Task 2
 │   │   │   │   │   ├── pipeline.py
-│   │   │   │   │   └── normalizer.py
+│   │   │   │   │   └── normalizer.py      # (M5, optional)
 │   │   │   │   └── orchestrate/           # Task 3
 │   │   │   │       ├── pipeline.py
-│   │   │   │       ├── tool_client.py
-│   │   │   │       └── state.py
-│   │   │   ├── prompts/                   # System prompts live here, versioned
-│   │   │   │   ├── triage_system.md
-│   │   │   │   ├── extract_system.md
-│   │   │   │   └── orchestrate_planner.md
-│   │   │   └── tests/                     # pytest, mocked LLM client
+│   │   │   │       ├── tool_client.py     # (M6)
+│   │   │   │       └── state.py           # (M6)
+│   │   │   ├── prompts/                   # (M4+) system prompts as versioned .md files
+│   │   │   ├── tests/                     # pytest, mocked LLM client via httpx.MockTransport
+│   │   │   └── .env.example
 │   │   ├── sample/        # Upstream reference stub — reference only, DO NOT DEPLOY
 │   │   └── eval/          # Local eval harness — DO NOT EDIT (upstream)
 │   ├── common/libs/       # Upstream libraries (fdebenchkit, fastapi helpers, models) — DO NOT EDIT
 │   └── data/              # Upstream public eval data — DO NOT EDIT
-├── infra/                 # Bicep + azd
+├── Dockerfile             # Multi-stage, non-root, at repo root
+├── .dockerignore
+├── infra/                 # Bicep + azd (deferred: currently imperative az CLI, see PLAN.md T2)
 └── ts/                    # TypeScript workspace — unused
 ```
 
@@ -115,6 +118,10 @@ Arufa/
 `py/common/libs/`, `py/data/`, or `py/apps/eval/`. They are upstream; edits create
 merge conflicts on `git merge upstream/main`. If you find a bug, open an issue
 upstream — do not patch locally.
+
+**Layout deviation:** the arch doc mentioned `src/arufa/`; we ship flat
+(`arufa/arufa/`) because it matches `apps/sample/` and avoids introducing
+a new pattern into the repo. See [PLAN.md D1](PLAN.md#deviations-from-docsarchitecturemd-log-as-they-happen).
 
 ---
 
@@ -240,11 +247,14 @@ failure path too.
 
 ## 11. Deployment conventions
 
-- **Dockerfile:** multi-stage (uv build stage → slim runtime), non-root user (`appuser`), `EXPOSE 8000`, `HEALTHCHECK` calls `/health`.
-- **Azure Container Apps:** `minReplicas=1`, `maxReplicas=5`, per-replica concurrency `30`, external HTTPS ingress, system-assigned MI granted `Cognitive Services OpenAI User` at the AOAI account scope.
-- **`azd up` is the only supported deploy command.** No ad-hoc `az containerapp update` from a laptop into shared infra.
-- **Rollback:** one command — `az containerapp revision set-mode --resource-group shivamarora --name arufa --mode single --revision <prior>`.
-- **Cost defence:** ACA scale-out is capped at 5, AOAI capacity is 50K TPM per deployment; both are sized for hackathon load, not sustained production.
+- **Dockerfile:** multi-stage (`python:3.12-slim` builder + runtime), non-root user (`appuser`), `EXPOSE 8000`, `HEALTHCHECK` calls `/health`. Build context is the repo root; `.dockerignore` keeps `.venv`, caches, `.git`, and `.env*` out.
+- **Image build:** use `az acr build` (cloud-side, ~45 s). Do **not** stream logs from a Windows PowerShell terminal — Colorama crashes on cp1252. Use `--no-wait --no-logs` and poll `az acr task list-runs` instead. Local `docker build` still works if Docker Desktop is running.
+- **Azure Container Apps:** `minReplicas=1`, `maxReplicas=5`, per-replica concurrency `30`, external HTTPS ingress, system-assigned MI. Registry pull via MI (`--registry-identity system` on create — auto-grants `AcrPull` on the ACR).
+- **AOAI auth on ACA:** M4+ deployments must grant the ACA MI `Cognitive Services OpenAI User` at the AOAI account scope and set `AOAI_AUTH_MODE=aad`. M3 skeleton uses `AOAI_AUTH_MODE=key` with no key (stubs don't call the model).
+- **Deployed FQDN (current):** `https://arufa.mangohill-daf67e16.westus.azurecontainerapps.io`
+- **Rollback:** `az containerapp revision set-mode --resource-group shivamarora --name arufa --mode single --revision <prior>`.
+- **IaC status:** infra currently provisioned imperatively via `az` CLI (see `PLAN.md` tech debt T2). Migrate to Bicep or `azd`-tracked before M8.
+- **Cost defence:** ACA scale-out capped at 5, AOAI capacity 50K TPM per deployment; both sized for hackathon load, not sustained production.
 
 ---
 
@@ -263,33 +273,46 @@ Do **not** clutter this file with milestone-level status — that lives in [`PLA
 
 ## 13. Quick commands
 
+> **Windows note:** the tool shell here occasionally strips inline `cd` commands. Prefer absolute paths where possible. `uv run` from a directory without a `pyproject.toml` picks up the system Python; always run from within `py/` or `py/apps/arufa/`, or use `--directory`.
+
 ```powershell
 # One-time setup
-cd py; uv sync --all-packages
+uv sync --all-packages --directory C:\Repos\Coding-Challenge\Arufa\py
 
 # Run our service locally
-cd py/apps/arufa; uv run uvicorn arufa.main:app --port 8000 --reload
+C:\Repos\Coding-Challenge\Arufa\py\.venv\Scripts\uvicorn.exe arufa.main:app `
+    --port 8000 --host 127.0.0.1 `
+    --app-dir C:\Repos\Coding-Challenge\Arufa\py\apps\arufa
 
 # Run the mock tool service for T3 local eval (separate terminal)
-cd py/apps/eval; uv run python mock_tool_service.py
+C:\Repos\Coding-Challenge\Arufa\py\.venv\Scripts\python.exe `
+    C:\Repos\Coding-Challenge\Arufa\py\apps\eval\mock_tool_service.py
 
 # Score locally
-cd py; uv run python apps/eval/run_eval.py --endpoint http://localhost:8000
+C:\Repos\Coding-Challenge\Arufa\py\.venv\Scripts\python.exe `
+    C:\Repos\Coding-Challenge\Arufa\py\apps\eval\run_eval.py --endpoint http://localhost:8000
 # Single task:
-cd py; uv run python apps/eval/run_eval.py --endpoint http://localhost:8000 --task triage
-
-# Format & lint
-cd py; uv run ruff format .; uv run ruff check --fix .
-
-# Type check
-cd py; uv run pyright apps/arufa
+#   ... run_eval.py --endpoint http://localhost:8000 --task triage
 
 # Tests
-cd py/apps/arufa; uv run pytest -v
-cd py/apps/arufa; uv run pytest -v -m "not live"
+C:\Repos\Coding-Challenge\Arufa\py\.venv\Scripts\pytest.exe `
+    C:\Repos\Coding-Challenge\Arufa\py\apps\arufa\tests -v
 
-# Deploy
-azd up
+# Format & lint
+uv run --directory C:\Repos\Coding-Challenge\Arufa\py ruff format .
+uv run --directory C:\Repos\Coding-Challenge\Arufa\py ruff check --fix .
+
+# Type check
+uv run --directory C:\Repos\Coding-Challenge\Arufa\py pyright apps/arufa
+
+# Deploy: build + push image, update revision
+$env:NO_COLOR = "1"
+az acr build --registry arufaacrshivamarora --resource-group shivamarora `
+    --image arufa:latest --file C:\Repos\Coding-Challenge\Arufa\Dockerfile `
+    --no-wait --no-logs C:\Repos\Coding-Challenge\Arufa
+# ... poll az acr task list-runs, then:
+az containerapp update --resource-group shivamarora --name arufa `
+    --image arufaacrshivamarora.azurecr.io/arufa:latest
 
 # Rebuild image and push a new revision
 azd deploy

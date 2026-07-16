@@ -6,6 +6,22 @@
 > [`docs/architecture.md`](docs/architecture.md) (design) and
 > [`CLAUDE.md`](CLAUDE.md) (non-negotiables).
 
+## Status
+
+| Milestone | Status | Notes |
+|---|---|---|
+| **M0** — Scaffold `apps/arufa` + `/health` | ✅ Done | pytest + local uvicorn green |
+| **M1** — Shared kernel | ✅ Done | 25/25 tests pass; ContextVar propagation required pure-ASGI middleware (see deviations) |
+| **M2** — Stub endpoints | ✅ Done | All 7 probes PASS, `items_errored=0` on all 3 tasks, composite 27.9 |
+| **M3** — Deploy skeleton to ACA | ✅ Done | HTTPS FQDN `arufa.mangohill-daf67e16.westus.azurecontainerapps.io`; deployed eval green |
+| M4 — Task 1 real pipeline | ⏳ Next | |
+| M5 — Task 2 real pipeline | ⏳ Blocked on M4 |  |
+| M6 — Task 3 real pipeline | ⏳ Blocked on M4 |  |
+| M7 — Iteration cycles | ⏳ | |
+| M8 — Redeploy full + load test | ⏳ | |
+| M9 — Submission docs | ⏳ | |
+| M10 — Submit | ⏳ | |
+
 ## How to read this
 
 - **T-shirt effort** — S (< ½ day), M (½–1 day), L (1–2 days).
@@ -406,3 +422,25 @@ numbered principles and constraints in [`docs/challenge/`](docs/challenge/) and
 - **Score before code.** Run `run_eval.py` before each iteration so we have a baseline for the change.
 - **Log every model change** in `docs/methodology.md`. Judges look for iteration discipline; if we can't retell the story we lose the AI Problem Solving marks.
 - **Never bypass `shared/llm/client.py`.** No task pipeline calls httpx directly. This is the only way retry + `Retry-After` + `X-Model-Name` propagation stays consistent.
+
+---
+
+## Deviations from `docs/architecture.md` (log as they happen)
+
+| # | Deviation | Why | Impact |
+|---|---|---|---|
+| D1 | Package layout is **flat** (`apps/arufa/arufa/`), not `src/arufa/` as the arch doc suggested | Matches the pattern already established by `apps/sample/` in the upstream repo; keeps hatchling config a single line. Introducing a new layout just for our app would violate CLAUDE.md's "don't introduce a new pattern without saying why." | None. Import paths (`arufa.main:app`) are identical either way. |
+| D2 | `RequestContextMiddleware` is a **pure ASGI middleware**, not `BaseHTTPMiddleware` as the arch doc's diagram showed | `BaseHTTPMiddleware` spawns the endpoint in a child task with a **copied** context, silently dropping `ContextVar` writes made by the LLM client. Documented Starlette limitation. Pure ASGI runs in the same async context. | None on behaviour; simpler and correct. Regression test: `test_with_llm_call_headers` in `tests/test_middleware.py`. |
+| D3 | **No global `Exception` handler** registered on the app | Starlette's `ServerErrorMiddleware` intercepts unhandled exceptions *outside* our middleware stack, so a global `Exception` handler is silently unreachable. Correct pattern is per-route `try/except → 200 + envelope` (already implemented in `main.py`). | None on the scored path. Any bare `raise` inside a pipeline that escapes the route-level `try` would produce a bare 500 with no headers — pipelines must catch. Called out in `docs/architecture.md §6.2` update. |
+| D4 | Validation error handler uses `fastapi.encoders.jsonable_encoder` on `exc.errors()` before serialising | Pydantic's `.errors()` includes raw `bytes` in the `input` field when Content-Type isn't JSON. Naïve `json.dumps` crashes and produces a 500 that fails probe 5. `jsonable_encoder` coerces bytes → str. | Fixed probe 5. Regression test: `test_wrong_content_type_does_not_crash` in `tests/test_exception_handlers.py`. |
+| D5 | Docker build uses `az acr build` (cloud-side), not local `docker build` | Colorama on Windows crashes when streaming the log output back through PowerShell (`UnicodeEncodeError: cp1252`). Cloud build works fine; queue with `--no-wait --no-logs` and poll. | ~45 s per build. Not blocking; Docker Desktop still available for local iteration if needed. |
+| D6 | Container App deployed with `AOAI_AUTH_MODE=key` and **no** `AOAI_API_KEY` env var | M3 stubs don't call AOAI, so no key is needed. Key/AAD wiring lands with M4 (T1 pipeline). | Any pipeline that tries to call AOAI on the deployed app right now will get `LLMUnavailable("AOAI_API_KEY not set")` — surfaces as `200 + errors[]` per the envelope contract, not a crash. |
+| D7 | ACA-side registry pull uses **system-assigned MI + AcrPull** grant on the ACR, not a service principal | Matches the CLAUDE.md principle "no keys in source". `az containerapp create --system-assigned --registry-identity system` auto-grants `AcrPull`. | None. |
+
+## Open tech debt (address before submission)
+
+- **T1**: AAD auth (`azure-identity` + `DefaultAzureCredential`) in `shared/llm/client.py` — needed for the deployed container to talk to AOAI without a key. Blocked on M4 (first task that actually calls the model).
+- **T2**: No infra as code yet. All Azure resources created imperatively via `az`. Migrate to Bicep or `azure.yaml` before M8 so redeploys are reproducible. Track in M3 tail-work.
+- **T3**: Test coverage on `arufa.main` (the route try/except → 200 + envelope path) is limited to happy-path stub tests. Add an explicit failure-injection test at M4 when we have a real pipeline that can be forced to raise.
+- **T4**: Structured logs currently emit at INFO on every request (`request_complete`). Fine at hackathon scale; noisy at 500-item eval scale. Consider sampling or moving to DEBUG once M4+ logs are added.
+- **T5**: The `structlog.processors.dict_tracebacks` processor is included but never exercised in M1 tests. Verify at M4 when the first real pipeline error is possible.

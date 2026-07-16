@@ -1,0 +1,44 @@
+# Files excluded from Docker build context.
+# Keep this tight — every extra file slows uploads to ACR.
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+
+# Virtualenvs / build outputs
+**/.venv/
+**/venv/
+**/dist/
+**/build/
+**/*.egg-info/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# IDE / editor / OS
+.vscode/
+.idea/
+**/.DS_Store
+**/Thumbs.db
+
+# Local secrets (never in the image)
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.azure.example
+
+# Node / TS (not used by this image)
+ts/
+**/node_modules/
+
+# Docs / logs
+*.md
+!README.md
+**/*.log
+eval_results.json
