@@ -14,10 +14,10 @@
 | **M1** — Shared kernel | ✅ Done | 25/25 tests pass; ContextVar propagation required pure-ASGI middleware (see deviations) |
 | **M2** — Stub endpoints | ✅ Done | All 7 probes PASS, `items_errored=0` on all 3 tasks, composite 27.9 |
 | **M3** — Deploy skeleton to ACA | ✅ Done | HTTPS FQDN `arufa.mangohill-daf67e16.westus.azurecontainerapps.io`; deployed eval green |
-| **M4** — Task 1 real pipeline | ✅ Code + tests | LLM triage + safety_rules + JSON parsing hardening. 22 new tests pass. **Live eval pending** — Azure auth endpoint (`login.microsoftonline.com`) unreachable from this network; user needs to fetch key manually to run `run_eval.py --task triage`. |
-| **M5** — Task 2 real pipeline | ✅ Code + tests | Vision pipeline (gpt-5-mini, `detail: high`), dynamic schema via JSON object mode, base64 → data URL. 10 new tests pass. **Live eval pending** same as M4. |
-| **M6** — Task 3 real pipeline | ✅ Code + tests | Single-shot planner + async tool_client + sequential executor + degrade-to-partial on tool failure. 18 new tests pass. Iterative agent-loop upgrade tracked as T6. **Live eval pending** same as M4. |
-| M7 — Iteration cycles | ⏳ Next | Blocked on live eval numbers |
+| **M4** — Task 1 real pipeline | ✅ Verified | LLM triage + safety_rules. 22 unit tests pass. **Live eval:** composite **43.3**, R=34.3 (category 0.28, priority 0.52, routing 0.37, missing_info 0.20, escalation 0.29), E=40.0 (cost 1.0, latency 0.0 — P95 4438 ms > 4200 ms worst), B=60.6, **all 7 probes PASS, 0 items errored**. All 5 sub-metrics below M4 floor targets → M7 iteration. |
+| **M5** — Task 2 real pipeline | ✅ Verified | Vision pipeline (gpt-5-mini, `detail: high`). 10 unit tests pass. **Live eval:** composite **75.9**, R=82.7 (info_accuracy **0.840**, text_fidelity **0.795** — **both exceed M5 floors**), E=47.0 (cost 0.9, latency 0.18 — P95 14.7 s), B=83.9. `concurrent_burst` probe FAILS (vision + semaphore=8 → queue-timeout under 20 concurrent). |
+| **M6** — Task 3 real pipeline | ✅ Verified | Single-shot planner + tool_client + executor. 18 unit tests pass. **Live eval:** composite **54.4**, R=48.0 (constraint_compliance **0.689**, ordering 0.54, tool_selection 0.58, param_accuracy 0.20, **goal_completion 0.00**), E=48.7 (cost 1.0, latency 0.15 — P95 6.1 s), B=68.8, **all 7 probes PASS, 0 items errored**. `goal_completion=0` is the biggest signal — M7 must fix. |
+| M7 — Iteration cycles | ⏳ Next | Clear priorities from M4-M6 live numbers: (1) T3 `goal_completion=0` — planner is missing an outcome-report step or a field the scorer keys on; (2) T1 all sub-metrics below floor — prompt tuning + possible reasoning_effort/model bump; (3) T2 latency (P95 14.7 s) — bump `LLM_MAX_CONCURRENCY` or add parallel image queue; (4) T2 `concurrent_burst` probe fix — same root cause. |
 | M8 — Redeploy full + load test | ⏳ | |
 | M9 — Submission docs | ⏳ | |
 | M10 — Submit | ⏳ | |
