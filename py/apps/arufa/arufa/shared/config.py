@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     aoai_api_key: str | None = Field(default=None)
 
     llm_timeout_s: float = Field(default=25.0, description="Per-attempt timeout; kept below platform 60 s ceiling")
-    llm_max_concurrency: int = Field(default=8, description="Async semaphore ceiling protecting AOAI TPM/RPM quota")
+    llm_max_concurrency: int = Field(default=20, description="Async semaphore ceiling; sized to fdebench probe 6 (20 concurrent burst) so nothing queues past its 15s deadline")
     llm_max_retries: int = Field(default=3, description="Total attempts, incl. first try")
 
     log_level: str = Field(default="INFO")
