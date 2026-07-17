@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.org/CreativeWork",
   "name": "Arufa",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "FDEBench solution: signal triaging, document extraction, and workflow orchestration served as one async FastAPI service on Azure Container Apps.",
   "team": "arorashivam96",
   "contact": "shivamarora@microsoft.com",
   "repository": "https://github.com/arorashivam96/Arufa",
   "api_endpoint": "https://arufa.mangohill-daf67e16.westus.azurecontainerapps.io",
-  "deployed_revision": "arufa--v032",
+  "deployed_revision": "arufa--v040",
   "language": "python",
   "python_version": "3.12",
   "framework": "fastapi",
@@ -18,9 +18,9 @@
   "llm_endpoint_region": "eastus2",
   "models": {
     "triage": {
-      "deployment": "gpt-5-nano",
-      "canonical_name": "gpt-5-nano",
-      "fdebench_cost_tier": 1.0,
+      "deployment": "gpt-5-mini",
+      "canonical_name": "gpt-5-mini",
+      "fdebench_cost_tier": 0.9,
       "reasoning_effort": "low"
     },
     "extract": {
@@ -48,7 +48,7 @@
   "reliability": {
     "per_call_timeout_s": 25,
     "max_concurrency": 20,
-    "max_retries": 3,
+    "max_retries": 2,
     "retry_after_honoured": true,
     "circuit_breaker": false,
     "envelope_pattern": "200 + errors[] on valid-input engine failure; 4xx only for malformed HTTP/JSON"
@@ -71,5 +71,5 @@
     "engineering_brief": "CLAUDE.md"
   },
   "license": "MIT",
-  "generated_at": "2026-07-16"
+  "generated_at": "2026-07-17"
 }

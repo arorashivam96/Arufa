@@ -122,8 +122,13 @@ async def run(
 
     try:
         result = await llm.chat(
-            deployment=settings.aoai_deployment_nano,
-            model_name=settings.aoai_model_name_nano,
+            # M12: switched from nano to mini. On the 1000-item hidden set
+            # nano's macro-F1 ceiling capped T1 R at ~30 pp regardless of
+            # prompt work. Mini's cost tier (0.9 vs 1.0) costs ~0.3 pp on
+            # composite; the ~10-15 pp R lift is expected to more than
+            # cover it.
+            deployment=settings.aoai_deployment_mini,
+            model_name=settings.aoai_model_name_mini,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},

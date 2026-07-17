@@ -34,9 +34,9 @@ class Settings(BaseSettings):
     aoai_auth_mode: Literal["key", "aad"] = Field(default="key")
     aoai_api_key: str | None = Field(default=None)
 
-    llm_timeout_s: float = Field(default=25.0, description="Per-attempt timeout; kept below platform 60 s ceiling")
+    llm_timeout_s: float = Field(default=25.0, description="Per-attempt timeout; kept below platform 60 s ceiling. Worst-case wall time with 2 attempts is 50 s (well inside 60 s).")
     llm_max_concurrency: int = Field(default=20, description="Async semaphore ceiling; sized to fdebench probe 6 (20 concurrent burst) so nothing queues past its 15s deadline")
-    llm_max_retries: int = Field(default=3, description="Total attempts, incl. first try")
+    llm_max_retries: int = Field(default=2, description="Total attempts, incl. first try. Reduced from 3 to prevent platform-side 60s timeouts on T2 slow items (M12).")
 
     log_level: str = Field(default="INFO")
 
