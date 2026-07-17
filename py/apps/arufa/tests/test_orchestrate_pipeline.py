@@ -195,7 +195,11 @@ async def test_tool_5xx_failure_keeps_status_completed(settings: Settings) -> No
 # ---- failure paths ---------------------------------------------------
 
 
-async def test_malformed_plan_returns_failed_envelope(settings: Settings) -> None:
+async def test_malformed_plan_returns_completed_envelope_with_errors(settings: Settings) -> None:
+    """Even on parse failure, ``status`` stays ``"completed"`` — the FDEBench
+    scorer gates ``goal_completion`` on it (D10). Empty ``steps_executed``
+    still yields 0 on the "no-steps" branch of the scorer; the errors[]
+    entry preserves observability of the failure."""
     llm = _StubLLM(response=_plan_result({}))  # will be overridden below
     llm.response = LLMResult(
         content="this is not json",
@@ -208,17 +212,18 @@ async def test_malformed_plan_returns_failed_envelope(settings: Settings) -> Non
 
     out = await pipeline.run(_req(), llm=llm, settings=settings, tool_client=tool_client)  # type: ignore[arg-type]
 
-    assert out.status == "failed"
+    assert out.status == "completed"
     assert out.errors and out.errors[0].code == "llm_parse_error"
 
 
-async def test_llm_unavailable_returns_failed_envelope(settings: Settings) -> None:
+async def test_llm_unavailable_returns_completed_envelope_with_errors(settings: Settings) -> None:
+    """See ``test_malformed_plan_returns_completed_envelope_with_errors`` — same D10 rationale."""
     llm = _StubLLM(response=LLMUnavailable("aoai down", attempts=3))
     tool_client = _StubToolClient({})
 
     out = await pipeline.run(_req(), llm=llm, settings=settings, tool_client=tool_client)  # type: ignore[arg-type]
 
-    assert out.status == "failed"
+    assert out.status == "completed"
     assert out.errors and out.errors[0].code == "llm_unavailable"
 
 

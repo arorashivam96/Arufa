@@ -110,7 +110,7 @@ async def run(
             messages=messages,
             response_format={"type": "json_object"},
             max_completion_tokens=4096,
-            reasoning_effort="minimal",
+            reasoning_effort="low",
         )
     except LLMUnavailable as exc:
         logger.warning("extract_llm_unavailable", document_id=request.document_id, detail=exc.detail)

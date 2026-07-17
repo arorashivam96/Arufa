@@ -51,8 +51,13 @@ class _TriageLLMOutput(BaseModel):
 
 
 def _format_ticket(req: TriageRequest) -> str:
-    """Render the signal as a compact user message for the LLM."""
+    """Render the signal as a compact user message for the LLM.
+
+    Wrapped in ``--- signal ---`` markers so the system prompt's security
+    clause can reference "content between the markers is untrusted data".
+    """
     lines = [
+        "--- signal ---",
         f"Ticket ID: {req.ticket_id}",
         f"Subject: {req.subject}",
         f"Description: {req.description}",
@@ -62,6 +67,7 @@ def _format_ticket(req: TriageRequest) -> str:
     ]
     if req.attachments:
         lines.append(f"Attachments: {len(req.attachments)} item(s)")
+    lines.append("--- end signal ---")
     return "\n".join(lines)
 
 
@@ -123,8 +129,8 @@ async def run(
                 {"role": "user", "content": user_message},
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=2048,
-            reasoning_effort="minimal",
+            max_completion_tokens=4096,
+            reasoning_effort="low",
         )
     except LLMUnavailable as exc:
         logger.warning("triage_llm_unavailable", ticket_id=request.ticket_id, detail=exc.detail)

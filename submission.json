@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.org/CreativeWork",
   "name": "Arufa",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "FDEBench solution: signal triaging, document extraction, and workflow orchestration served as one async FastAPI service on Azure Container Apps.",
   "team": "arorashivam96",
   "contact": "shivamarora@microsoft.com",
   "repository": "https://github.com/arorashivam96/Arufa",
   "api_endpoint": "https://arufa.mangohill-daf67e16.westus.azurecontainerapps.io",
-  "deployed_revision": "arufa--0000002",
+  "deployed_revision": "arufa--v032",
   "language": "python",
   "python_version": "3.12",
   "framework": "fastapi",
@@ -21,13 +21,13 @@
       "deployment": "gpt-5-nano",
       "canonical_name": "gpt-5-nano",
       "fdebench_cost_tier": 1.0,
-      "reasoning_effort": "minimal"
+      "reasoning_effort": "low"
     },
     "extract": {
       "deployment": "gpt-5-mini",
       "canonical_name": "gpt-5-mini",
       "fdebench_cost_tier": 0.9,
-      "reasoning_effort": "minimal",
+      "reasoning_effort": "medium",
       "image_detail": "high"
     },
     "orchestrate": {
@@ -35,7 +35,8 @@
       "canonical_name": "gpt-5-nano",
       "fdebench_cost_tier": 1.0,
       "reasoning_effort": "minimal",
-      "planner_strategy": "single-shot"
+      "planner_strategy": "single-shot",
+      "executor": "parallel-batched (consecutive same-tool steps run via asyncio.gather)"
     }
   },
   "endpoints": {
