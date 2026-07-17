@@ -6,11 +6,16 @@ Container App overrides these via env vars.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
+
+# arufa/shared/config.py → parent=shared, parent.parent=arufa, parent.parent.parent=apps/arufa/
+_APP_ROOT = Path(__file__).parent.parent.parent
+_ENV_FILE = _APP_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -36,7 +41,8 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Resolve .env relative to the app root so uvicorn works from any cwd.
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,

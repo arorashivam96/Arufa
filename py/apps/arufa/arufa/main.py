@@ -3,9 +3,13 @@
 Exposes the four endpoints scored by FDEBench:
 
 - ``GET  /health``      liveness probe
-- ``POST /triage``      task 1
-- ``POST /extract``     task 2
-- ``POST /orchestrate`` task 3
+- ``POST /triage``      task 1 (M4: real LLM pipeline)
+- ``POST /extract``     task 2 (M5)
+- ``POST /orchestrate`` task 3 (M6)
+
+The shared LLM client is created once at startup via ``lifespan`` and
+attached to ``app.state``. Route handlers pull it from ``request.app.state``
+so tests can override the client without touching module-level singletons.
 
 Each scored route wraps its pipeline in ``try/except`` so an engine
 failure surfaces as ``HTTP 200`` + task envelope with ``errors[]``,
@@ -20,7 +24,11 @@ Run locally::
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
+from fastapi import Request
 
 from arufa import extract as extract_pkg
 from arufa import orchestrate as orchestrate_pkg
@@ -28,7 +36,9 @@ from arufa import triage as triage_pkg
 from arufa.extract.pipeline import run as _run_extract
 from arufa.orchestrate.pipeline import run as _run_orchestrate
 from arufa.shared import exception_handlers
+from arufa.shared.config import Settings
 from arufa.shared.config import get_settings
+from arufa.shared.llm import LLMClient
 from arufa.shared.middleware import RequestContextMiddleware
 from arufa.shared.models import ErrorEntry
 from arufa.shared.models.extract import ExtractRequest
@@ -49,13 +59,37 @@ settings = get_settings()
 configure_logging(settings.log_level)
 logger = get_logger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Provision and dispose of the shared LLM client."""
+    client = LLMClient(settings=settings)
+    app.state.llm_client = client
+    app.state.settings = settings
+    logger.info("arufa_startup", model_nano=settings.aoai_model_name_nano, endpoint=settings.aoai_endpoint or "<unset>")
+    try:
+        yield
+    finally:
+        await client.aclose()
+        logger.info("arufa_shutdown")
+
+
 app = FastAPI(
     title="Arufa",
     description="Signal triaging, extraction, and orchestration for FDEBench",
     version="0.1.0",
+    lifespan=lifespan,
 )
 app.add_middleware(RequestContextMiddleware)
 exception_handlers.register(app)
+
+
+def _llm(request: Request) -> LLMClient:
+    return request.app.state.llm_client
+
+
+def _settings(request: Request) -> Settings:
+    return request.app.state.settings
 
 
 @app.get("/health")
@@ -65,14 +99,14 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/triage")
-async def triage(request: TriageRequest) -> TriageResponse:
+async def triage(request: TriageRequest, http_request: Request) -> TriageResponse:
     """Task 1: signal triage.
 
     Engine failures return ``HTTP 200`` with a safe-default envelope and
     an ``errors[]`` entry — never 5xx (per FDEBench contract).
     """
     try:
-        return await _run_triage(request)
+        return await _run_triage(request, _llm(http_request), _settings(http_request))
     except Exception as exc:
         logger.exception("triage_pipeline_failed", ticket_id=request.ticket_id)
         return TriageResponse(
@@ -89,10 +123,10 @@ async def triage(request: TriageRequest) -> TriageResponse:
 
 
 @app.post("/extract")
-async def extract(request: ExtractRequest) -> ExtractResponse:
+async def extract(request: ExtractRequest, http_request: Request) -> ExtractResponse:
     """Task 2: document extraction."""
     try:
-        return await _run_extract(request)
+        return await _run_extract(request, _llm(http_request), _settings(http_request))
     except Exception as exc:
         logger.exception("extract_pipeline_failed", document_id=request.document_id)
         return ExtractResponse(
@@ -102,10 +136,10 @@ async def extract(request: ExtractRequest) -> ExtractResponse:
 
 
 @app.post("/orchestrate")
-async def orchestrate(request: OrchestrateRequest) -> OrchestrateResponse:
+async def orchestrate(request: OrchestrateRequest, http_request: Request) -> OrchestrateResponse:
     """Task 3: workflow orchestration."""
     try:
-        return await _run_orchestrate(request)
+        return await _run_orchestrate(request, _llm(http_request), _settings(http_request))
     except Exception as exc:
         logger.exception("orchestrate_pipeline_failed", task_id=request.task_id)
         return OrchestrateResponse(

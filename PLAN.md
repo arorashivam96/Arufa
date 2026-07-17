@@ -14,10 +14,10 @@
 | **M1** — Shared kernel | ✅ Done | 25/25 tests pass; ContextVar propagation required pure-ASGI middleware (see deviations) |
 | **M2** — Stub endpoints | ✅ Done | All 7 probes PASS, `items_errored=0` on all 3 tasks, composite 27.9 |
 | **M3** — Deploy skeleton to ACA | ✅ Done | HTTPS FQDN `arufa.mangohill-daf67e16.westus.azurecontainerapps.io`; deployed eval green |
-| M4 — Task 1 real pipeline | ⏳ Next | |
-| M5 — Task 2 real pipeline | ⏳ Blocked on M4 |  |
-| M6 — Task 3 real pipeline | ⏳ Blocked on M4 |  |
-| M7 — Iteration cycles | ⏳ | |
+| **M4** — Task 1 real pipeline | ✅ Code + tests | LLM triage + safety_rules + JSON parsing hardening. 22 new tests pass. **Live eval pending** — Azure auth endpoint (`login.microsoftonline.com`) unreachable from this network; user needs to fetch key manually to run `run_eval.py --task triage`. |
+| **M5** — Task 2 real pipeline | ✅ Code + tests | Vision pipeline (gpt-5-mini, `detail: high`), dynamic schema via JSON object mode, base64 → data URL. 10 new tests pass. **Live eval pending** same as M4. |
+| **M6** — Task 3 real pipeline | ✅ Code + tests | Single-shot planner + async tool_client + sequential executor + degrade-to-partial on tool failure. 18 new tests pass. Iterative agent-loop upgrade tracked as T6. **Live eval pending** same as M4. |
+| M7 — Iteration cycles | ⏳ Next | Blocked on live eval numbers |
 | M8 — Redeploy full + load test | ⏳ | |
 | M9 — Submission docs | ⏳ | |
 | M10 — Submit | ⏳ | |
@@ -436,11 +436,15 @@ numbered principles and constraints in [`docs/challenge/`](docs/challenge/) and
 | D5 | Docker build uses `az acr build` (cloud-side), not local `docker build` | Colorama on Windows crashes when streaming the log output back through PowerShell (`UnicodeEncodeError: cp1252`). Cloud build works fine; queue with `--no-wait --no-logs` and poll. | ~45 s per build. Not blocking; Docker Desktop still available for local iteration if needed. |
 | D6 | Container App deployed with `AOAI_AUTH_MODE=key` and **no** `AOAI_API_KEY` env var | M3 stubs don't call AOAI, so no key is needed. Key/AAD wiring lands with M4 (T1 pipeline). | Any pipeline that tries to call AOAI on the deployed app right now will get `LLMUnavailable("AOAI_API_KEY not set")` — surfaces as `200 + errors[]` per the envelope contract, not a crash. |
 | D7 | ACA-side registry pull uses **system-assigned MI + AcrPull** grant on the ACR, not a service principal | Matches the CLAUDE.md principle "no keys in source". `az containerapp create --system-assigned --registry-identity system` auto-grants `AcrPull`. | None. |
+| D8 | **T3 uses single-shot planning**, not the iterative agent-loop mentioned in the arch doc | Single-shot keeps us inside the P95 ≤ 1,500 ms budget on nano-tier. Iterative loops need N × (LLM + tool) round-trips, which blows the budget on any workflow > 2 steps. | Local T3 score won't reflect this trade-off (mock = answer key). If hidden T3 lands low, upgrade to iterative agent-loop at M7 — tracked as tech debt T6. |
+| D9 | **LLM output parsing is defensive** (unwraps `` ```json fences and prose wrap `` around the JSON) even though the prompts explicitly forbid these | gpt-5-nano/mini occasionally emit fences under adversarial prompts. Cheap to handle, expensive to lose an item for. | None; belt-and-braces. Same helper used in T1, T2, T3 pipelines. |
 
 ## Open tech debt (address before submission)
 
-- **T1**: AAD auth (`azure-identity` + `DefaultAzureCredential`) in `shared/llm/client.py` — needed for the deployed container to talk to AOAI without a key. Blocked on M4 (first task that actually calls the model).
+- **T1**: AAD auth (`azure-identity` + `DefaultAzureCredential`) in `shared/llm/client.py` — needed for the deployed container to talk to AOAI without a key. Blocked on M4 (first task that actually calls the model). Deployed image still needs key or AAD switch — M4 deploy pending.
 - **T2**: No infra as code yet. All Azure resources created imperatively via `az`. Migrate to Bicep or `azure.yaml` before M8 so redeploys are reproducible. Track in M3 tail-work.
-- **T3**: Test coverage on `arufa.main` (the route try/except → 200 + envelope path) is limited to happy-path stub tests. Add an explicit failure-injection test at M4 when we have a real pipeline that can be forced to raise.
+- **T3**: Test coverage on `arufa.main` (the route try/except → 200 + envelope path) is limited to happy-path stub tests. Add an explicit failure-injection test at M4 when we have a real pipeline that can be forced to raise. **Partially addressed:** `test_triage_pipeline`, `test_extract_pipeline`, `test_orchestrate_pipeline` each cover the `LLMUnavailable → 200 + errors[]` path.
 - **T4**: Structured logs currently emit at INFO on every request (`request_complete`). Fine at hackathon scale; noisy at 500-item eval scale. Consider sampling or moving to DEBUG once M4+ logs are added.
-- **T5**: The `structlog.processors.dict_tracebacks` processor is included but never exercised in M1 tests. Verify at M4 when the first real pipeline error is possible.
+- **T5**: The `structlog.processors.dict_tracebacks` processor is included but never exercised in M1 tests. Verify at M4 when the first real pipeline error is possible. **Addressed:** the pipeline-failure test paths exercise it; observed working via the pytest run (traceback rendering was visible in the bare-Python smoke test we ran during M4).
+- **T6** (new at M6): Orchestrate pipeline is single-shot planning. Iterative agent-loop with the OpenAI tool-calling API would handle adaptive workflows better on the hidden eval; single-shot trades adaptability for the tight P95 ≤ 1,500 ms budget. Upgrade at M7 if hidden T3 numbers demand it.
+- **T7** (new at M4): The bare `TestClient(app)` invocation (without `with` context manager) does not run the FastAPI lifespan, so `app.state.llm_client` is not set. Tests currently use `with TestClient(app) as client:` correctly. Document this in `CLAUDE.md §6` alongside the other FastAPI gotchas.

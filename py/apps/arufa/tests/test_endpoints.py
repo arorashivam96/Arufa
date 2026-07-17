@@ -1,14 +1,21 @@
-"""Smoke tests for the three scored endpoints (M2 stubs).
+"""Smoke tests for the three scored endpoints.
 
-These verify the routes exist, accept the input schema, and return
-schema-valid envelopes. Real accuracy comes in M4/M5/M6.
+Verifies that the routes exist, accept the input schema, and return
+schema-valid envelopes. Value-level assertions live in per-pipeline
+test files (``test_triage_pipeline.py`` etc.) with mocked LLM clients —
+those are the deterministic ones. This file only checks the HTTP layer.
 """
 
 from __future__ import annotations
 
+from typing import get_args
+
 from fastapi.testclient import TestClient
 
 from arufa.main import app
+from arufa.shared.models.triage import Category
+from arufa.shared.models.triage import Priority
+from arufa.shared.models.triage import Team
 
 
 def _triage_payload() -> dict:
@@ -58,12 +65,13 @@ def _orchestrate_payload() -> dict:
     }
 
 
-def test_triage_stub_returns_valid_envelope() -> None:
-    client = TestClient(app)
-    r = client.post("/triage", json=_triage_payload())
+def test_triage_endpoint_returns_valid_envelope() -> None:
+    """/triage returns a schema-valid envelope; concrete values are
+    tested in ``test_triage_pipeline.py`` with mocked LLMs."""
+    with TestClient(app) as client:
+        r = client.post("/triage", json=_triage_payload())
     assert r.status_code == 200
     body = r.json()
-    # Contract keys per docs/challenge/task1/README.md
     for k in (
         "ticket_id",
         "category",
@@ -76,37 +84,38 @@ def test_triage_stub_returns_valid_envelope() -> None:
     ):
         assert k in body, f"missing {k}"
     assert body["ticket_id"] == "SIG-TEST-001"
-    assert body["category"] == "Not a Mission Signal"
-    assert body["assigned_team"] == "None"
-    assert body["priority"] == "P4"
+    assert body["category"] in get_args(Category)
+    assert body["priority"] in get_args(Priority)
+    assert body["assigned_team"] in get_args(Team)
+    assert isinstance(body["missing_information"], list)
 
 
-def test_extract_stub_returns_valid_envelope() -> None:
-    client = TestClient(app)
-    r = client.post("/extract", json=_extract_payload())
+def test_extract_endpoint_returns_valid_envelope() -> None:
+    with TestClient(app) as client:
+        r = client.post("/extract", json=_extract_payload())
     assert r.status_code == 200
     body = r.json()
     assert body["document_id"] == "DOC-TEST-001"
 
 
-def test_orchestrate_stub_returns_valid_envelope() -> None:
-    client = TestClient(app)
-    r = client.post("/orchestrate", json=_orchestrate_payload())
+def test_orchestrate_endpoint_returns_valid_envelope() -> None:
+    with TestClient(app) as client:
+        r = client.post("/orchestrate", json=_orchestrate_payload())
     assert r.status_code == 200
     body = r.json()
     assert body["task_id"] == "TASK-TEST-001"
-    assert body["status"] == "completed"
-    assert body["steps_executed"] == []
+    assert body["status"] in ("completed", "partial", "failed")
+    assert isinstance(body["steps_executed"], list)
 
 
 def test_middleware_headers_present_on_all_scored_endpoints() -> None:
-    client = TestClient(app)
-    for path, payload in (
-        ("/triage", _triage_payload()),
-        ("/extract", _extract_payload()),
-        ("/orchestrate", _orchestrate_payload()),
-    ):
-        r = client.post(path, json=payload)
-        assert r.status_code == 200
-        assert r.headers.get("x-request-id"), f"no x-request-id on {path}"
-        assert r.headers.get("x-latency-ms"), f"no x-latency-ms on {path}"
+    with TestClient(app) as client:
+        for path, payload in (
+            ("/triage", _triage_payload()),
+            ("/extract", _extract_payload()),
+            ("/orchestrate", _orchestrate_payload()),
+        ):
+            r = client.post(path, json=payload)
+            assert r.status_code == 200
+            assert r.headers.get("x-request-id"), f"no x-request-id on {path}"
+            assert r.headers.get("x-latency-ms"), f"no x-latency-ms on {path}"
