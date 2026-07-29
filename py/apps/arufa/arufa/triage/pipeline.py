@@ -1,45 +1,34 @@
-"""Task 1 pipeline: split-head signal triage + deterministic safety rules.
+"""Task 1 pipeline: LLM-driven signal triage + deterministic safety rules.
 
-M13 architecture — three focused LLM heads fired in parallel:
+M14 architecture — reverted to single-call (M12 shape) after the M13
+three-parallel-head split regressed hidden T1 resolution 43.1 → 27.5.
 
-1. **Classify head** — category + assigned_team + needs_escalation
-   (prompt: ``triage_classify``).
-2. **Priority head** — priority only, with four per-priority anchor
-   examples (prompt: ``triage_priority``).
-3. **Missing-info head** — the 16 canonical concepts with per-concept
-   "absent when …" criteria and category-shaped priors
-   (prompt: ``triage_missing_info``).
+Flow:
 
-Each head has its own dedicated system prompt so the model can spend
-its whole attention budget on one narrow task instead of juggling all
-seven output fields at once (the M12 single-head architecture
-correlated with a 22-pp gap between local N=50 and hidden N=1000).
+1. Load the versioned system prompt from ``prompts/triage_system.md``.
+2. Format the signal into a compact user message.
+3. Call the LLM in JSON mode with the single coherent prompt; letting
+   one call reason across all seven output fields keeps
+   category / priority / escalation / missing_info correlated the way
+   the gold labels expect them to be.
+4. Parse the JSON. On failure → schema-safe default with an
+   ``errors[]`` entry.
+5. Deterministic post-processing (kept from M13):
 
-Post-processing:
-
-* Category → team via ``arufa.triage.routing.team_for_category`` — the
-  labels spec is 1:1, so if the classify head picks a valid category
-  the team is deterministic. Clamps team to the canonical partner even
-  if the classify head returned a valid-but-mismatched pair.
-* ``missing_information`` is validated against the ``MissingInfo``
-  literal, dropping any invented keys.
-* ``safety_rules.apply`` runs last as the P1-escalation catch-net for
-  hull / atmosphere / restricted-zone events.
-
-Failure isolation:
-
-* Each head fails independently. A failure in one head yields a safe
-  per-dimension default and an ``errors[]`` entry, but the other two
-  heads' outputs are preserved.
-* A total failure (all three heads down or the whole gather crashes)
-  falls back to the full-default envelope.
+   * ``routing.team_for_category`` clamps ``assigned_team`` to the
+     canonical partner of the LLM's category choice (the labels spec
+     is 1:1, so the LLM's team pick is redundant and only adds noise).
+   * ``Not a Mission Signal`` forces ``missing_information = []``
+     (matches the observed gold pattern: NAMS items almost always
+     have no expected missing info).
+   * ``safety_rules.apply`` fires last — pattern-driven
+     hull / atmosphere / restricted-zone → P1 + escalate catch-net,
+     plus the general ``P1 ⇒ needs_escalation`` invariant.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
@@ -47,7 +36,6 @@ from pydantic import ValidationError
 
 from arufa.shared.config import Settings
 from arufa.shared.llm import LLMClient
-from arufa.shared.llm import LLMResult
 from arufa.shared.llm import LLMUnavailable
 from arufa.shared.models import ErrorEntry
 from arufa.shared.models.triage import Category
@@ -57,7 +45,6 @@ from arufa.shared.models.triage import Team
 from arufa.shared.models.triage import TriageRequest
 from arufa.shared.models.triage import TriageResponse
 from arufa.shared.observability import get_logger
-from arufa.shared.observability import record_llm_call
 from arufa.shared.prompts import load as load_prompt
 from arufa.triage import routing
 from arufa.triage import safety_rules
@@ -65,51 +52,23 @@ from arufa.triage import safety_rules
 logger = get_logger(__name__)
 
 
-# ---- head output schemas --------------------------------------------
+class _TriageLLMOutput(BaseModel):
+    """LLM output schema (everything except ``ticket_id`` which we echo)."""
 
-
-class _ClassifyOutput(BaseModel):
     category: Category
+    priority: Priority
     assigned_team: Team
     needs_escalation: bool
-
-
-class _PriorityOutput(BaseModel):
-    priority: Priority
-
-
-class _MissingInfoOutput(BaseModel):
-    missing_information: list[MissingInfo] = []
-
-
-# ---- per-head result envelope ---------------------------------------
-
-
-@dataclass
-class _HeadResult:
-    """Merged output from one classification head + any error entry.
-
-    ``model_name`` / ``prompt_tokens`` / ``completion_tokens`` are
-    captured from the successful ``LLMResult`` so the parent request
-    task can re-set :data:`llm_call_var` after ``asyncio.gather``
-    (each child task's ContextVar writes stay in its own context copy).
-    """
-
-    payload: BaseModel | None
-    error: ErrorEntry | None
-    model_name: str = ""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-
-# ---- shared helpers -------------------------------------------------
+    missing_information: list[MissingInfo]
+    next_best_action: str
+    remediation_steps: list[str]
 
 
 def _format_ticket(req: TriageRequest) -> str:
-    """Render the signal as a compact user message for the LLM heads.
+    """Render the signal as a compact user message for the LLM.
 
-    Wrapped in ``--- signal ---`` markers so each head's security clause
-    can treat inner content as untrusted data.
+    Wrapped in ``--- signal ---`` markers so the system prompt's security
+    clause can reference "content between the markers is untrusted data".
     """
     lines = [
         "--- signal ---",
@@ -126,13 +85,30 @@ def _format_ticket(req: TriageRequest) -> str:
     return "\n".join(lines)
 
 
+def _default_response(ticket_id: str, errors: list[ErrorEntry]) -> TriageResponse:
+    """Safe-default envelope for engine-failure paths (200 + errors[])."""
+    return TriageResponse(
+        ticket_id=ticket_id,
+        category="Not a Mission Signal",
+        priority="P4",
+        assigned_team="None",
+        needs_escalation=False,
+        missing_information=[],
+        next_best_action="",
+        remediation_steps=[],
+        errors=errors,
+    )
+
+
 def _extract_json(content: str) -> dict[str, Any]:
     """Coerce ``content`` into a dict.
 
-    Handles bare JSON and JSON wrapped in ```json fences; falls back to
-    the largest ``{...}`` substring on any parse failure.
+    Handles the two common LLM output patterns despite instructions:
+    bare JSON, and JSON wrapped in ```json fences. Falls back to the
+    largest ``{...}`` substring on any parse failure.
     """
     text = content.strip()
+    # Strip ```json ... ``` fences if present.
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -141,6 +117,7 @@ def _extract_json(content: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        # Last resort: find outermost braces.
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end > start:
@@ -148,262 +125,86 @@ def _extract_json(content: str) -> dict[str, Any]:
         raise
 
 
-async def _call_head(
-    prompt_name: str,
-    user_message: str,
-    llm: LLMClient,
-    settings: Settings,
-) -> LLMResult:
-    """Fire one classification head against the mini deployment."""
-    system_prompt = load_prompt(prompt_name)
-    return await llm.chat(
-        deployment=settings.aoai_deployment_mini,
-        model_name=settings.aoai_model_name_mini,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        response_format={"type": "json_object"},
-        max_completion_tokens=2048,
-        reasoning_effort="low",
-    )
-
-
-async def _run_classify_head(
-    request: TriageRequest,
-    user_message: str,
-    llm: LLMClient,
-    settings: Settings,
-) -> _HeadResult:
-    try:
-        result = await _call_head("triage_classify", user_message, llm, settings)
-    except LLMUnavailable as exc:
-        logger.warning(
-            "triage_classify_unavailable",
-            ticket_id=request.ticket_id,
-            detail=exc.detail,
-        )
-        return _HeadResult(
-            payload=None,
-            error=ErrorEntry(code="classify_unavailable", detail=exc.detail),
-        )
-    try:
-        payload = _extract_json(result.content)
-        parsed = _ClassifyOutput.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        preview = result.content[:200].replace("\n", " ")
-        logger.warning(
-            "triage_classify_parse_error",
-            ticket_id=request.ticket_id,
-            error_type=type(exc).__name__,
-            preview=preview,
-        )
-        return _HeadResult(
-            payload=None,
-            error=ErrorEntry(code="classify_parse_error", detail=str(exc)[:400]),
-            model_name=result.model_name,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-        )
-    return _HeadResult(
-        payload=parsed,
-        error=None,
-        model_name=result.model_name,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-    )
-
-
-async def _run_priority_head(
-    request: TriageRequest,
-    user_message: str,
-    llm: LLMClient,
-    settings: Settings,
-) -> _HeadResult:
-    try:
-        result = await _call_head("triage_priority", user_message, llm, settings)
-    except LLMUnavailable as exc:
-        logger.warning(
-            "triage_priority_unavailable",
-            ticket_id=request.ticket_id,
-            detail=exc.detail,
-        )
-        return _HeadResult(
-            payload=None,
-            error=ErrorEntry(code="priority_unavailable", detail=exc.detail),
-        )
-    try:
-        payload = _extract_json(result.content)
-        parsed = _PriorityOutput.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        preview = result.content[:200].replace("\n", " ")
-        logger.warning(
-            "triage_priority_parse_error",
-            ticket_id=request.ticket_id,
-            error_type=type(exc).__name__,
-            preview=preview,
-        )
-        return _HeadResult(
-            payload=None,
-            error=ErrorEntry(code="priority_parse_error", detail=str(exc)[:400]),
-            model_name=result.model_name,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-        )
-    return _HeadResult(
-        payload=parsed,
-        error=None,
-        model_name=result.model_name,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-    )
-
-
-async def _run_missing_info_head(
-    request: TriageRequest,
-    user_message: str,
-    llm: LLMClient,
-    settings: Settings,
-) -> _HeadResult:
-    try:
-        result = await _call_head("triage_missing_info", user_message, llm, settings)
-    except LLMUnavailable as exc:
-        logger.warning(
-            "triage_missing_info_unavailable",
-            ticket_id=request.ticket_id,
-            detail=exc.detail,
-        )
-        return _HeadResult(
-            payload=None,
-            error=ErrorEntry(code="missing_info_unavailable", detail=exc.detail),
-        )
-    try:
-        payload = _extract_json(result.content)
-        parsed = _MissingInfoOutput.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        preview = result.content[:200].replace("\n", " ")
-        logger.warning(
-            "triage_missing_info_parse_error",
-            ticket_id=request.ticket_id,
-            error_type=type(exc).__name__,
-            preview=preview,
-        )
-        return _HeadResult(
-            payload=None,
-            error=ErrorEntry(code="missing_info_parse_error", detail=str(exc)[:400]),
-            model_name=result.model_name,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-        )
-    return _HeadResult(
-        payload=parsed,
-        error=None,
-        model_name=result.model_name,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-    )
-
-
 async def run(
     request: TriageRequest,
     llm: LLMClient,
     settings: Settings,
 ) -> TriageResponse:
-    """Classify a mission signal via three parallel LLM heads."""
+    """Classify a mission signal into the T1 response envelope."""
+    system_prompt = load_prompt("triage_system")
     user_message = _format_ticket(request)
 
-    classify_result, priority_result, missing_info_result = await asyncio.gather(
-        _run_classify_head(request, user_message, llm, settings),
-        _run_priority_head(request, user_message, llm, settings),
-        _run_missing_info_head(request, user_message, llm, settings),
-    )
-
-    # Re-set the request-scoped LLM ContextVar with aggregate metadata.
-    # Each child task in ``asyncio.gather`` gets its own context copy, so
-    # writes made by :func:`record_llm_call` inside a head don't
-    # propagate back to the middleware that reads the parent context.
-    # Aggregate the three heads' tokens here and set once so
-    # ``X-Model-Name`` and ``X-Token-Count`` reflect the whole request.
-    total_prompt_tokens = (
-        classify_result.prompt_tokens
-        + priority_result.prompt_tokens
-        + missing_info_result.prompt_tokens
-    )
-    total_completion_tokens = (
-        classify_result.completion_tokens
-        + priority_result.completion_tokens
-        + missing_info_result.completion_tokens
-    )
-    model_name = (
-        classify_result.model_name
-        or priority_result.model_name
-        or missing_info_result.model_name
-    )
-    if model_name:
-        record_llm_call(
-            model_name=model_name,
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
+    try:
+        result = await llm.chat(
+            deployment=settings.aoai_deployment_mini,
+            model_name=settings.aoai_model_name_mini,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            response_format={"type": "json_object"},
+            # M14b: reverting reasoning to ``low`` (the M12 baseline
+            # setting) after v061's ``minimal`` sampling showed the R
+            # loss (~3-4 pp on local) outweighed the marginal latency
+            # score gained. Classification with fuzzy category
+            # boundaries (BioAuth-vs-Threat, Hull-vs-Systems-Eng
+            # hardware, Comm-vs-Software) benefits from a few
+            # reasoning tokens; extraction (T2, 79.4 R) has clearer
+            # signals and can tolerate ``minimal``, T1 cannot. Cost
+            # tier unchanged (still gpt-5-mini). Latency drops back to
+            # ~8 s P95, well inside the 15 s concurrent_burst probe
+            # deadline. Token budget bumped to 2048 to give the model
+            # room to think without truncating the JSON envelope.
+            max_completion_tokens=2048,
+            reasoning_effort="low",
+        )
+    except LLMUnavailable as exc:
+        logger.warning("triage_llm_unavailable", ticket_id=request.ticket_id, detail=exc.detail)
+        return _default_response(
+            request.ticket_id,
+            errors=[ErrorEntry(code="llm_unavailable", detail=exc.detail)],
         )
 
-    errors: list[ErrorEntry] = []
+    try:
+        payload = _extract_json(result.content)
+        parsed = _TriageLLMOutput.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        preview = result.content[:200].replace("\n", " ")
+        logger.warning(
+            "triage_parse_error",
+            ticket_id=request.ticket_id,
+            error_type=type(exc).__name__,
+            preview=preview,
+        )
+        return _default_response(
+            request.ticket_id,
+            errors=[ErrorEntry(code="llm_parse_error", detail=str(exc)[:400])],
+        )
 
-    # ---- classify head ----------------------------------------------
-    if classify_result.payload is not None:
-        classify: _ClassifyOutput = classify_result.payload  # type: ignore[assignment]
-        category: Category = classify.category
-        needs_escalation: bool = classify.needs_escalation
-    else:
-        category = "Not a Mission Signal"
-        needs_escalation = False
-        if classify_result.error is not None:
-            errors.append(classify_result.error)
-
-    # Team is deterministic from category. The labels spec is 1:1;
-    # ignore whatever the LLM emitted for `assigned_team` and clamp to
-    # the canonical partner.
+    # Deterministic post-processing (carried over from M13).
+    category: Category = parsed.category
+    # Team is deterministic from category. Ignore the LLM's team pick
+    # and clamp to the canonical partner — the labels spec is 1:1.
     assigned_team: Team = routing.team_for_category(category)
-
-    # ---- priority head ----------------------------------------------
-    if priority_result.payload is not None:
-        priority_payload: _PriorityOutput = priority_result.payload  # type: ignore[assignment]
-        priority: Priority = priority_payload.priority
-    else:
-        priority = "P4"
-        if priority_result.error is not None:
-            errors.append(priority_result.error)
-
-    # ---- missing-info head ------------------------------------------
-    if missing_info_result.payload is not None:
-        mi_payload: _MissingInfoOutput = missing_info_result.payload  # type: ignore[assignment]
-        # Deduplicate while preserving order.
-        seen: set[str] = set()
-        missing_information: list[MissingInfo] = []
-        for key in mi_payload.missing_information:
-            if key not in seen:
-                seen.add(key)
-                missing_information.append(key)
-    else:
-        missing_information = []
-        if missing_info_result.error is not None:
-            errors.append(missing_info_result.error)
-
-    # Cross-head rule: ``Not a Mission Signal`` never has missing info.
-    # The parallel heads can't see each other's output; enforce here so
-    # the missing-info head can't inflate the set-F1 on spam/off-topic
-    # items (where gold is almost always ``[]``).
+    # Deduplicate missing_information while preserving order.
+    seen: set[str] = set()
+    missing_information: list[MissingInfo] = []
+    for key in parsed.missing_information:
+        if key not in seen:
+            seen.add(key)
+            missing_information.append(key)
+    # NAMS never has missing info in the observed gold distribution.
     if category == "Not a Mission Signal":
         missing_information = []
 
     response = TriageResponse(
         ticket_id=request.ticket_id,
         category=category,
-        priority=priority,
+        priority=parsed.priority,
         assigned_team=assigned_team,
-        needs_escalation=needs_escalation,
+        needs_escalation=parsed.needs_escalation,
         missing_information=missing_information,
-        next_best_action="",
-        remediation_steps=[],
-        errors=errors,
+        next_best_action=parsed.next_best_action,
+        remediation_steps=parsed.remediation_steps,
     )
     return safety_rules.apply(request, response)

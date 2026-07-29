@@ -109,8 +109,15 @@ async def run(
             model_name=settings.aoai_model_name_mini,
             messages=messages,
             response_format={"type": "json_object"},
+            # M14 latency tuning: vision + reasoning=low was spending
+            # 4-8k reasoning tokens per document, pushing hidden P95 to
+            # 24 s (worst=19 s → latency score clamped to 0). The
+            # extraction contract is well-defined (fixed schema, direct
+            # OCR + field mapping), so ``minimal`` reasoning is enough:
+            # the model still runs the vision pass at full detail, just
+            # spends far fewer tokens deliberating.
             max_completion_tokens=4096,
-            reasoning_effort="low",
+            reasoning_effort="minimal",
         )
     except LLMUnavailable as exc:
         logger.warning("extract_llm_unavailable", document_id=request.document_id, detail=exc.detail)
