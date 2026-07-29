@@ -69,14 +69,34 @@ def triggered_reasons(request: TriageRequest) -> list[str]:
 
 
 def apply(request: TriageRequest, response: TriageResponse) -> TriageResponse:
-    """Force ``P1`` + ``needs_escalation=true`` when any trigger fires.
+    """Enforce safety invariants after the LLM heads have run.
 
-    Category and team stay LLM-decided; forcing them here would eat F1
-    without adding value.
+    Two rules, applied in order:
+
+    1. **Pattern-triggered P1 catch-net.** Force ``P1`` +
+       ``needs_escalation=true`` when any of the hull /
+       atmosphere / restricted-zone patterns fires on the ticket text.
+       Category and team stay LLM-decided; forcing them here would eat
+       F1 without adding value.
+    2. **P1 implies escalation.** Any ``P1`` priority — from the LLM
+       priority head or from rule (1) — must have
+       ``needs_escalation=true``. The split-head architecture otherwise
+       lets the classify head decide escalation without seeing the
+       priority head's output, which correlated with a large drop in
+       escalation F1 vs the older single-shot architecture. The
+       priority head has stronger per-priority anchor examples than the
+       classify head does for the escalation boolean, so using it as
+       the driver is the higher-precision path.
     """
     reasons = triggered_reasons(request)
-    if not reasons:
-        return response
+    if reasons:
+        # FrozenBaseModel is immutable — build a new instance.
+        response = response.model_copy(
+            update={"priority": "P1", "needs_escalation": True}
+        )
 
-    # FrozenBaseModel is immutable — build a new instance.
-    return response.model_copy(update={"priority": "P1", "needs_escalation": True})
+    # P1 → escalate (deterministic post-processing).
+    if response.priority == "P1" and not response.needs_escalation:
+        response = response.model_copy(update={"needs_escalation": True})
+
+    return response
