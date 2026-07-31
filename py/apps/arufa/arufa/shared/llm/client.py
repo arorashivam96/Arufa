@@ -11,14 +11,21 @@ Every LLM call in Arufa flows through this module. The client owns:
   headers pick them up regardless of success or failure.
 
 Auth modes:
-* ``key``: local development. Reads ``AOAI_API_KEY``.
-* ``aad``: cloud deployment via managed identity. **Not yet wired** — will
-  land alongside the ACA deployment (M3).
+* ``key``: reads ``AOAI_API_KEY``. Used for local dev when Entra ID is
+  unavailable; also the historical default before the M15 MI migration.
+* ``aad``: acquires a bearer token via ``DefaultAzureCredential``. In the
+  Container App this resolves to the system-assigned managed identity;
+  locally it falls through to Azure CLI credential (``az login``).
+  Tokens are cached by the credential and refreshed automatically.
+  Required by the S360 Safe-Secrets standard (SFI-ID4.3.1) for
+  Cognitive Services / AOAI resources.
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from collections.abc import Awaitable
 from collections.abc import Callable
 from typing import Any
@@ -40,6 +47,13 @@ _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 # 60 s platform deadline; also caps AOAI Retry-After suggestions.
 _MAX_SLEEP_S = 10.0
 
+# Cognitive Services token scope for AOAI. Same for all regions.
+_AOAI_SCOPE = "https://cognitiveservices.azure.com/.default"
+
+# Refresh a cached token this many seconds before its stated expiry to
+# avoid racing an expiry between header build and HTTP send.
+_TOKEN_REFRESH_LEEWAY_S = 60.0
+
 
 class LLMClient:
     """Reusable async chat-completion client.
@@ -60,11 +74,33 @@ class LLMClient:
         self._http = http_client or httpx.AsyncClient()
         self._sem = asyncio.Semaphore(settings.llm_max_concurrency)
         self._sleep: Callable[[float], Awaitable[None]] = sleep_fn or asyncio.sleep
+        # Lazily-constructed Entra ID credential for the ``aad`` auth mode.
+        # The credential itself caches tokens; we cache the raw string +
+        # expiry so header builds don't need an await round-trip on the
+        # hot path. Guarded by a lock because ``chat()`` is fan-in from
+        # many coroutines within one event loop but the credential's
+        # internal state is fine either way.
+        self._aad_credential: Any = None
+        self._cached_token: str | None = None
+        self._cached_token_expires_at: float = 0.0
+        self._token_lock = threading.Lock()
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client if we own it."""
         if self._owns_client:
             await self._http.aclose()
+        # Best-effort close of the sync Entra credential if it was
+        # created. ``DefaultAzureCredential`` from ``azure.identity``
+        # (sync) exposes ``close()`` on most sub-credentials; no-op if
+        # already closed.
+        cred = self._aad_credential
+        if cred is not None:
+            close = getattr(cred, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # pragma: no cover - defensive
+                    pass
 
     async def chat(
         self,
@@ -219,11 +255,57 @@ class LLMClient:
                 raise LLMUnavailable("AOAI_API_KEY not set", attempts=0)
             headers["api-key"] = self._settings.aoai_api_key
             return headers
-        # AAD path lands at M3 alongside the ACA deployment.
-        raise LLMUnavailable(
-            "AAD auth mode configured but not yet wired (arriving at M3)",
-            attempts=0,
-        )
+        # ``aad`` — bearer token via Entra ID. In-cluster this resolves
+        # to the ACA system-assigned managed identity (must have the
+        # ``Cognitive Services OpenAI User`` role on the AOAI account);
+        # locally it falls through to Azure CLI credential.
+        token = self._get_aad_token()
+        headers["authorization"] = f"Bearer {token}"
+        return headers
+
+    def _get_aad_token(self) -> str:
+        """Return a cached bearer token, refreshing near expiry.
+
+        Uses the *sync* ``azure.identity.DefaultAzureCredential`` under a
+        thread lock. The credential's ``get_token`` does its own HTTP
+        under the hood, but token acquisition is not on the per-request
+        hot path once cached (typical AOAI token TTL is ~1 hour), so a
+        brief blocking call here is acceptable versus the extra async
+        plumbing the async credential would require.
+        """
+        now = time.time()
+        cached = self._cached_token
+        if cached is not None and now < self._cached_token_expires_at - _TOKEN_REFRESH_LEEWAY_S:
+            return cached
+        with self._token_lock:
+            # Re-check under the lock — another thread may have refreshed.
+            cached = self._cached_token
+            if cached is not None and now < self._cached_token_expires_at - _TOKEN_REFRESH_LEEWAY_S:
+                return cached
+            if self._aad_credential is None:
+                try:
+                    # Deferred import so that unit tests + the ``key``
+                    # auth path do not pull in ``azure-identity`` on
+                    # module import.
+                    from azure.identity import DefaultAzureCredential
+                except ImportError as exc:  # pragma: no cover
+                    raise LLMUnavailable(
+                        f"azure-identity not installed: {exc}",
+                        attempts=0,
+                    ) from exc
+                self._aad_credential = DefaultAzureCredential(
+                    exclude_interactive_browser_credential=True,
+                )
+            try:
+                access = self._aad_credential.get_token(_AOAI_SCOPE)
+            except Exception as exc:
+                raise LLMUnavailable(
+                    f"Entra token acquisition failed: {type(exc).__name__}: {exc}",
+                    attempts=0,
+                ) from exc
+            self._cached_token = access.token
+            self._cached_token_expires_at = float(access.expires_on)
+            return access.token
 
     @staticmethod
     def _to_result(payload: dict[str, Any], model_name: str) -> LLMResult:
